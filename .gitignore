@@ -1,3 +1,18 @@
 *~
 *.pyc
 build/
+
+# Nix
+result
+result-*
+.direnv/
+.envrc
+
+# Docker
+.docker/
+docker-cache/
+tmp-*/
+
+# Temporary files
+*.tmp
+*.bak

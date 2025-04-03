@@ -25,12 +25,12 @@
 #include <vector>
 #include <string>
 #include <microhttpd.h>
+#include <pthread.h>
 
-using namespace std;
+namespace pastec {
 
 class RequestHandler;
 struct ConnectionInfo;
-
 
 #define GET             0
 #define POST            1
@@ -72,14 +72,15 @@ private:
 struct ConnectionInfo
 {
     int connectionType;
-    string url;
+    std::string url;
     struct MHD_PostProcessor *postprocessor;
-    string answerString;
+    std::string answerString;
     int answerCode;
-    string authKey;
-    string contentType;  // Added to store Content-Type header
+    std::string authKey;
 
-    vector<char> uploadedData;
+    std::vector<char> uploadedData;
 };
+
+} // namespace pastec
 
 #endif // PASTEC_HTTPSERVER_H

@@ -62,6 +62,7 @@ enum MessagesOut
     SEARCH_RESULTS =                    0x10070100,
 
     IMAGE_DOWNLOADER_HTTP_ERROR =       0x10080100,
+    BATCH_PROCESSED =                   0x10080200,
 };
 
 
@@ -110,6 +111,7 @@ public:
             case SEARCH_RESULTS: s = "SEARCH_RESULTS"; break;
 
             case IMAGE_DOWNLOADER_HTTP_ERROR: s = "IMAGE_DOWNLOADER_HTTP_ERROR"; break;
+            case BATCH_PROCESSED: s = "BATCH_PROCESSED"; break;
 
             default: break;
         }

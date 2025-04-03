@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <memory>
 #include <sstream>
+#include <sys/time.h>
 
 #include <json/json.h>
 
@@ -40,8 +41,17 @@ RequestHandler::RequestHandler(FeatureExtractor *featureExtractor,
                Searcher *imageSearcher, Index *index,
                ImageDownloader *imgDownloader, string authKey)
     : featureExtractor(featureExtractor), imageSearcher(imageSearcher),
-      index(index), authKey(authKey)
-{ }
+      index(index), imgDownloader(imgDownloader), authKey(authKey)
+{
+    // Initialize the batch processor
+    batchProcessor = new BatchProcessor(imgDownloader, featureExtractor, 
+                                       dynamic_cast<ORBIndex*>(index));
+}
+
+RequestHandler::~RequestHandler()
+{
+    delete batchProcessor;
+}
 
 
 /**
@@ -120,6 +130,7 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
     vector<string> parsedURI = parseURI(conInfo.url);
 
     string p_image[] = {"index", "images", "IDENTIFIER", ""};
+    string p_imageBatch[] = {"index", "images", "batch", ""};
     string p_tag[] = {"index", "images", "IDENTIFIER", "tag", ""};
     string p_searchImage[] = {"index", "searcher", ""};
     string p_ioIndex[] = {"index", "io", ""};
@@ -137,32 +148,44 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
         && conInfo.connectionType == POST)
     {
         u_int32_t i_imageId = atoi(parsedURI[2].c_str());
-
         unsigned i_nbFeaturesExtracted;
-        u_int32_t i_ret = featureExtractor->processNewImage(
-            i_imageId, conInfo.uploadedData.size(), conInfo.uploadedData.data(),
-            i_nbFeaturesExtracted);
+        u_int32_t i_ret;
 
-        if (i_ret == IMAGE_NOT_DECODED)
+        // Check if the content type is JSON
+        if (conInfo.contentType.find("application/json") != string::npos)
         {
-            // Check if the data is an image URL to load
-            string dataStr(conInfo.uploadedData.begin(),
-                           conInfo.uploadedData.end());
-
+            // Process as JSON with URL            
+            string dataStr(conInfo.uploadedData.begin(), conInfo.uploadedData.end());
             Json::Value data = StringToJson(dataStr);
             string imgURL = data["url"].asString();
+                        
             if (imgDownloader->canDownloadImage(imgURL))
             {
                 std::vector<char> imgData;
                 long HTTPResponseCode;
                 i_ret = imgDownloader->getImageData(imgURL, imgData, HTTPResponseCode);
                 if (i_ret == OK)
+                {
                     i_ret = featureExtractor->processNewImage(
                         i_imageId, imgData.size(), imgData.data(),
                         i_nbFeaturesExtracted);
+                }
                 else
+                {
                     ret["image_downloader_http_response_code"] = (Json::Int64)HTTPResponseCode;
+                }
             }
+            else
+            {
+                i_ret = MISFORMATTED_REQUEST;
+            }
+        }
+        else
+        {
+            // Process as direct image upload
+            i_ret = featureExtractor->processNewImage(
+                i_imageId, conInfo.uploadedData.size(), conInfo.uploadedData.data(),
+                i_nbFeaturesExtracted);
         }
 
         ret["type"] = Converter::codeToString(i_ret);
@@ -178,6 +201,59 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
         u_int32_t i_ret = index->removeImage(i_imageId);
         ret["type"] = Converter::codeToString(i_ret);
         ret["image_id"] = Json::Value(i_imageId);
+    }
+    else if (testURIWithPattern(parsedURI, p_imageBatch)
+             && conInfo.connectionType == POST)
+    {
+        string dataStr(conInfo.uploadedData.begin(),
+                      conInfo.uploadedData.end());
+        
+        Json::Value data = StringToJson(dataStr);
+        
+        // Validate the request format
+        if (!data.isArray()) {
+            ret["type"] = Converter::codeToString(MISFORMATTED_REQUEST);
+            conInfo.answerString = JsonToString(ret);
+            return;
+        }
+        
+        // Convert JSON array to vector
+        vector<Json::Value> batchData;
+        for (unsigned i = 0; i < data.size(); i++) {
+            batchData.push_back(data[i]);
+        }
+        
+        // Process the batch
+        vector<BatchImageResult> results = batchProcessor->processBatch(batchData);
+        
+        // Create response
+        ret["type"] = Converter::codeToString(BATCH_PROCESSED);
+        
+        Json::Value resultsArray(Json::arrayValue);
+        for (const auto& result : results) {
+            Json::Value resultObj;
+            resultObj["image_id"] = result.imageId;
+            resultObj["url"] = result.url;
+            resultObj["type"] = Converter::codeToString(result.status);
+            
+            if (result.status == IMAGE_ADDED) {
+                resultObj["nb_features_extracted"] = result.nbFeaturesExtracted;
+                
+                // Include tag status if a tag was provided
+                if (!result.tag.empty()) {
+                    resultObj["tag"] = result.tag;
+                    resultObj["tag_status"] = Converter::codeToString(IMAGE_TAG_ADDED);
+                }
+            }
+            
+            if (!result.url.empty() && result.status != IMAGE_ADDED) {
+                resultObj["image_downloader_http_response_code"] = (Json::Int64)result.httpResponseCode;
+            }
+            
+            resultsArray.append(resultObj);
+        }
+        
+        ret["results"] = resultsArray;
     }
     else if (testURIWithPattern(parsedURI, p_tag)
              && conInfo.connectionType == POST)
@@ -203,28 +279,46 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
     else if (testURIWithPattern(parsedURI, p_searchImage)
             && conInfo.connectionType == POST)
     {
+        timeval t_start, t_end;
+        gettimeofday(&t_start, NULL);
+        
         SearchRequest req;
-        req.imageData = conInfo.uploadedData;
         req.client = NULL;
-        u_int32_t i_ret = imageSearcher->searchImage(req);
+        u_int32_t i_ret;
 
-        if (i_ret == IMAGE_NOT_DECODED)
-        {
-            // Check if the data is an image URL to load
-            string dataStr(conInfo.uploadedData.begin(),
-                        conInfo.uploadedData.end());
-
+        // Check if the content type is JSON
+        if (conInfo.contentType.find("application/json") != string::npos)
+        {            
+            string dataStr(conInfo.uploadedData.begin(), conInfo.uploadedData.end());
             Json::Value data = StringToJson(dataStr);
-            string imgURL = data["url"].asString();
+            string imgURL = data["url"].asString();            
+            
             if (imgDownloader->canDownloadImage(imgURL))
             {
                 std::vector<char> imgData;
                 long HTTPResponseCode;
+                
+                // Add timing for the image download
+                timeval t_download_start, t_download_end;
+                gettimeofday(&t_download_start, NULL);
+                
                 i_ret = imgDownloader->getImageData(imgURL, imgData, HTTPResponseCode);
+                
+                gettimeofday(&t_download_end, NULL);
+                cout << "Image download time: " << getTimeDiff(t_download_start, t_download_end) << " ms." << endl;
+                
                 if (i_ret == OK)
                 {
                     req.imageData = imgData;
+                    
+                    // Add timing for the search call
+                    timeval t_search_start, t_search_end;
+                    gettimeofday(&t_search_start, NULL);
+                    
                     i_ret = imageSearcher->searchImage(req);
+                    
+                    gettimeofday(&t_search_end, NULL);
+                    cout << "Search function call time: " << getTimeDiff(t_search_start, t_search_end) << " ms." << endl;
                 }
                 else {
                     ret["type"] = Converter::codeToString(i_ret);
@@ -233,6 +327,24 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
                     return;
                 }
             }
+            else
+            {
+                i_ret = MISFORMATTED_REQUEST;
+            }
+        }
+        else
+        {
+            // Process as direct image upload
+            req.imageData = conInfo.uploadedData;
+            
+            // Add timing for the search call
+            timeval t_search_start, t_search_end;
+            gettimeofday(&t_search_start, NULL);
+            
+            i_ret = imageSearcher->searchImage(req);
+            
+            gettimeofday(&t_search_end, NULL);
+            cout << "Search function call time: " << getTimeDiff(t_search_start, t_search_end) << " ms." << endl;
         }
 
         ret["type"] = Converter::codeToString(i_ret);
@@ -273,12 +385,18 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
             }
             ret["results"] = results;
         }
+        
+        gettimeofday(&t_end, NULL);
+        cout << "Total search request processing time: " << getTimeDiff(t_start, t_end) << " ms." << endl;
     }
 
     // And this is the updated similar search handler
     else if (testURIWithPattern(parsedURI, p_image)
             && conInfo.connectionType == GET)
     {
+        timeval t_start, t_end;
+        gettimeofday(&t_start, NULL);
+        
         SearchRequest req;
         req.imageId = atoi(parsedURI[2].c_str());
         req.client = NULL;
@@ -323,6 +441,9 @@ void RequestHandler::handleRequest(ConnectionInfo &conInfo)
             }
             ret["results"] = results;
         }
+        
+        gettimeofday(&t_end, NULL);
+        cout << "Total similar search request processing time: " << getTimeDiff(t_start, t_end) << " ms." << endl;
     }
     else if (testURIWithPattern(parsedURI, p_ioIndex)
              && conInfo.connectionType == POST)
@@ -417,4 +538,17 @@ Json::Value RequestHandler::StringToJson(string inputStr)
     ss.str(inputStr);
     Json::parseFromStream(builder, ss, &data, &errs);
     return data;
+}
+
+
+/**
+ * @brief Get the time difference in ms between two instants.
+ * @param t1 the start time
+ * @param t2 the end time
+ * @return the time difference in milliseconds
+ */
+unsigned long RequestHandler::getTimeDiff(const timeval t1, const timeval t2) const
+{
+    return ((t2.tv_sec - t1.tv_sec) * 1000000
+            + (t2.tv_usec - t1.tv_usec)) / 1000;
 }

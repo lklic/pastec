@@ -135,7 +135,7 @@ int HTTPServer::stop()
 }
 
 
-int HTTPServer::sendAnswer(struct MHD_Connection *connection, ConnectionInfo &conInfo)
+MHD_Result HTTPServer::sendAnswer(struct MHD_Connection *connection, ConnectionInfo &conInfo)
 {
     int ret;
     struct MHD_Response *response;
@@ -151,7 +151,7 @@ int HTTPServer::sendAnswer(struct MHD_Connection *connection, ConnectionInfo &co
     ret = MHD_queue_response(connection, conInfo.answerCode, response);
     MHD_destroy_response(response);
 
-    return ret;
+    return (MHD_Result)ret;
 }
 
 
@@ -173,7 +173,7 @@ void HTTPServer::requestCompleted(void *cls, MHD_Connection *connection,
 }
 
 
-int HTTPServer::answerToConnection(void *cls, MHD_Connection *connection,
+MHD_Result HTTPServer::answerToConnection(void *cls, MHD_Connection *connection,
                                    const char *url, const char *method,
                                    const char *version, const char *upload_data,
                                    size_t *upload_data_size, void **conCls)
@@ -231,7 +231,7 @@ int HTTPServer::answerToConnection(void *cls, MHD_Connection *connection,
 }
 
 
-int HTTPServer::readAuthHeader(void *cls, enum MHD_ValueKind kind,
+MHD_Result HTTPServer::readAuthHeader(void *cls, enum MHD_ValueKind kind,
                                const char *key, const char *value)
 {
     (void) kind;
@@ -244,6 +244,10 @@ int HTTPServer::readAuthHeader(void *cls, enum MHD_ValueKind kind,
     {
         conInfo->authKey = string(value);
         return MHD_NO;
+    }
+    else if (keyString == "content-type")
+    {
+        conInfo->contentType = string(value);
     }
 
     return MHD_YES;

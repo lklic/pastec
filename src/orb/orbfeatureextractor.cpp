@@ -35,6 +35,56 @@ ORBFeatureExtractor::ORBFeatureExtractor(ORBIndex *index, ORBWordIndex *wordInde
     : index(index), wordIndex(wordIndex), orb(ORB::create(2000, 1.02, 100))
 { }
 
+u_int32_t ORBFeatureExtractor::extractFeatures(unsigned i_imageId, unsigned i_imgSize,
+                                             char *p_imgData, list<HitForward> &hits,
+                                             unsigned &i_nbFeaturesExtracted)
+{
+    Mat img;
+    u_int32_t i_ret = ImageLoader::loadImage(i_imgSize, p_imgData, img);
+    if (i_ret != OK)
+        return i_ret;
+
+    vector<KeyPoint> keypoints;
+    Mat descriptors;
+
+    orb->detectAndCompute(img, noArray(), keypoints, descriptors);
+    i_nbFeaturesExtracted = keypoints.size();
+
+    unsigned i_nbKeyPoints = 0;
+    unordered_set<u_int32_t> matchedWords;
+    for (unsigned i = 0; i < keypoints.size(); ++i)
+    {
+        i_nbKeyPoints++;
+
+        // Recording the angle on 16 bits.
+        u_int16_t angle = keypoints[i].angle / 360 * (1 << 16);
+        u_int16_t x = keypoints[i].pt.x;
+        u_int16_t y = keypoints[i].pt.y;
+
+        vector<int> indices(1);
+        vector<int> dists(1);
+        wordIndex->knnSearch(descriptors.row(i), indices, dists, 1);
+
+        for (unsigned j = 0; j < indices.size(); ++j)
+        {
+            const unsigned i_wordId = indices[j];
+            if (matchedWords.find(i_wordId) == matchedWords.end())
+            {
+                HitForward newHit;
+                newHit.i_wordId = i_wordId;
+                newHit.i_imageId = i_imageId;
+                newHit.i_angle = angle;
+                newHit.x = x;
+                newHit.y = y;
+                hits.push_back(newHit);
+                matchedWords.insert(i_wordId);
+            }
+        }
+    }
+
+    return IMAGE_ADDED;
+}
+
 
 u_int32_t ORBFeatureExtractor::processNewImage(unsigned i_imageId, unsigned i_imgSize,
                                                char *p_imgData, unsigned &i_nbFeaturesExtracted)

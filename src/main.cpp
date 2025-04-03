@@ -22,6 +22,10 @@
 #include <iostream>
 #include <signal.h>
 
+#ifdef USE_MIMALLOC
+#include <mimalloc.h>
+#endif
+
 #include <httpserver.h>
 #include <requesthandler.h>
 #include <orb/orbfeatureextractor.h>
@@ -42,12 +46,18 @@ void intHandler(int signum) {
 void printUsage()
 {
     cout << "Usage :" << endl
-         << "./PastecIndex [-p portNumber] [-i indexPath] [--forward-index] [--https] [--auth-key AuthKey] visualWordList" << endl;
+         << "./PastecIndex [-p portNumber] [-i indexPath] [-t tagsPath] [--forward-index] [--https] [--auth-key AuthKey] visualWordList" << endl;
 }
 
 
 int main(int argc, char** argv)
 {
+#ifdef USE_MIMALLOC
+    // Initialize mimalloc
+    mi_version();
+    cout << "Using mimalloc memory allocator" << endl;
+#endif
+
     cout << "Pastec Index v0.0.1" << endl;
 
     if (argc < 2)
@@ -66,6 +76,7 @@ int main(int argc, char** argv)
     unsigned i_port = 4212;
     string visualWordPath;
     string indexPath(DEFAULT_INDEX_PATH);
+    string tagsPath;
     bool buildForwardIndex = false;
     string authKey("");
     bool https = false;
@@ -82,6 +93,11 @@ int main(int argc, char** argv)
         {
             EXIT_IF_LAST_ARGUMENT()
             indexPath = argv[++i];
+        }
+        else if (string(argv[i]) == "-t")
+        {
+            EXIT_IF_LAST_ARGUMENT()
+            tagsPath = argv[++i];
         }
         else if (string(argv[i]) == "--auth-key")
         {
@@ -108,7 +124,7 @@ int main(int argc, char** argv)
         ++i;
     }
 
-    Index *index = new ORBIndex(indexPath, buildForwardIndex);
+    Index *index = new ORBIndex(indexPath, tagsPath, buildForwardIndex);
     ORBWordIndex *wordIndex = new ORBWordIndex(visualWordPath);
     FeatureExtractor *ife = new ORBFeatureExtractor((ORBIndex *)index, wordIndex);
     Searcher *is = new ORBSearcher((ORBIndex *)index, wordIndex);

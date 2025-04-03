@@ -5,13 +5,26 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILDKIT_INLINE_CACHE: 1  # Enable BuildKit inline caching
     ports:
       - '4212:4212'
     restart: always
     volumes:
-      - ./../pastec-index:/pastec/build/pastec-index:rw
+      - ./../pastec-index:/app/data/pastec-index:rw
+      - /opt/data/images:/opt/data/images:ro
+    environment:
+      - MIMALLOC_LARGE_OS_PAGES=1
+      - MALLOC_CONF=thp:always,metadata_thp:always
+      - GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+      - SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
+      - CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
     command:
-      - /bin/sh 
-      - -c
-      - |
-        ./pastec -p 4212 -i /pastec/build/pastec-index/pastec-index.dat /pastec/data/visualWordsORB.dat
+      - /app/bin/pastec
+      - -p
+      - "4212"
+      - -i
+      - /app/data/pastec-index/pastec_index.dat
+      - -t
+      - /app/data/pastec-index/pastec_tags_index.dat
+      - /app/data/visualWordsORB.dat

@@ -49,7 +49,7 @@
 #include <imagereranker.h>
 
 
-void RANSACThread::getRTMatrix(const Point2f* a, const Point2f* b,
+void RANSACHelper::getRTMatrix(const Point2f* a, const Point2f* b,
                                int count, Mat& M, bool fullAffine)
 {
     CV_Assert( M.isContinuous() );
@@ -133,12 +133,13 @@ void RANSACThread::getRTMatrix(const Point2f* a, const Point2f* b,
 }
 
 
-cv::Mat RANSACThread::pastecEstimateRigidTransform(InputArray src1, InputArray src2,
+cv::Mat RANSACHelper::pastecEstimateRigidTransform(InputArray src1, InputArray src2,
                                                    bool fullAffine)
 {
     Mat M(2, 3, CV_64F), A = src1.getMat(), B = src2.getMat();
 
-    const int RANSAC_MAX_ITERS = 5000;
+    // Reduced from 5000 to 1000 to improve performance
+    const int RANSAC_MAX_ITERS = 1000;
     const int RANSAC_SIZE0 = 3;
 
     std::vector<Point2f> pA, pB;

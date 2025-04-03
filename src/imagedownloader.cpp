@@ -22,6 +22,7 @@
 
 #include <imagedownloader.h>
 #include <messages.h>
+#include <fstream>
 
 
 ImageDownloader::ImageDownloader()
@@ -34,7 +35,8 @@ bool ImageDownloader::canDownloadImage(std::string imgURL)
 {
     bool ret = false;
     if (imgURL.substr(0, 7) == std::string("http://")
-        || imgURL.substr(0, 8) == std::string("https://"))
+        || imgURL.substr(0, 8) == std::string("https://")
+        || imgURL.substr(0, 7) == std::string("file://"))
         ret = true;
     return ret;
 }
@@ -46,6 +48,31 @@ u_int32_t ImageDownloader::getImageData(std::string imgURL, std::vector<char> &i
     if (!canDownloadImage(imgURL))
         return ERROR_GENERIC;
 
+    // Handle file:// URLs
+    if (imgURL.substr(0, 7) == std::string("file://")) {
+        std::string filePath = imgURL.substr(7); // Remove "file://"
+        
+        // Open file
+        std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            responseCode = 404; // Not found
+            return IMAGE_DOWNLOADER_HTTP_ERROR;
+        }
+        
+        // Get file size
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        
+        // Read file into imgData vector
+        imgData.resize(size);
+        if (!file.read((char*)imgData.data(), size)) {
+            responseCode = 500; // Error reading
+            return IMAGE_DOWNLOADER_HTTP_ERROR;
+        }
+        
+        responseCode = 200; // Success
+        return OK;
+    }
 
     u_int32_t i_ret = OK;
 
@@ -89,5 +116,3 @@ size_t ImageDownloader::writeCallback(char *ptr, size_t size, size_t nmemb, void
 
     return sizeToWrite;
 }
-
-

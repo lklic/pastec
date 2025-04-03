@@ -31,54 +31,69 @@
 #include <opencv2/calib3d/calib3d.hpp>
 
 #include <imagereranker.h>
+#include <orb/orbindex.h>
 
 
-void *RANSACThread::run()
+/**
+ * @brief Rerank images using a vector of sorted results.
+ * @param imagesReqHits the hits of the request image.
+ * @param indexHits the hits of the index.
+ * @param sortedResults the sorted vector of results (weight, imageId).
+ * @param i_nbResults the number of results to rerank.
+ * @return A vector of reranked search results.
+ */
+vector<SearchResult> ImageReranker::rerank(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
+                                         unordered_map<u_int32_t, const vector<Hit>* > &indexHits,
+                                         const vector<pair<float, u_int32_t>> &sortedResults,
+                                         unsigned i_nbResults)
 {
-    for (unsigned i = 0; i < imageIds.size(); ++i)
+    unordered_set<u_int32_t> firstImageIds;
+    // Extract the first i_nbResults ranked images from the vector.
+    getFirstImageIds(sortedResults, i_nbResults, firstImageIds);         
+    // Continue with the common reranking logic
+    return rerankCommon(imagesReqHits, indexHits, firstImageIds);
+}
+
+/**
+ * @brief Return the first ids of ranked images from a sorted vector.
+ * @param sortedResults the sorted vector of results (weight, imageId).
+ * @param i_nbResults the number of images to return.
+ * @param firstImageIds a set to return the image ids.
+ */
+void ImageReranker::getFirstImageIds(const vector<pair<float, u_int32_t>> &sortedResults,
+                                    unsigned i_nbResults, unordered_set<u_int32_t> &firstImageIds)
+{
+    unsigned i_res = 0;
+    for (const auto& result : sortedResults)
     {
-        const unsigned i_imageId = imageIds[i];
-        const Histogram histogram = histograms[i];
-        unsigned i_binMax = max_element(histogram.bins, histogram.bins + HISTOGRAM_NB_BINS) - histogram.bins;
-        float i_maxVal = histogram.bins[i_binMax];
-        if (i_maxVal > 10)
-        {
-            RANSACTask &task = imgTasks[i_imageId];
-            assert(task.points1.size() == task.points2.size());
-
-            if (task.points1.size() >= RANSAC_MIN_INLINERS)
-            {
-                Mat H = pastecEstimateRigidTransform(task.points2, task.points1, true);
-
-                if (countNonZero(H) == 0)
-                    continue;
-
-                Rect bRect1 = boundingRect(task.points1);
-
-                pthread_mutex_lock(&mutex);
-                rankedResultsOut.push(SearchResult(i_maxVal, i_imageId, bRect1));
-                pthread_mutex_unlock(&mutex);
-            }
-        }
+        if (i_res >= i_nbResults)
+            break;
+        
+        firstImageIds.insert(result.second); // Insert the image ID
+        i_res++;
     }
 }
 
-
-void ImageReranker::rerank(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
-                           unordered_map<u_int32_t, vector<Hit> > &indexHits,
-                           priority_queue<SearchResult> &rankedResultsIn,
-                           priority_queue<SearchResult> &rankedResultsOut,
-                           unsigned i_nbResults)
+/**
+ * @brief Common reranking implementation.
+ * @param imagesReqHits the hits of the request image.
+ * @param indexHits the hits of the index.
+ * @param firstImageIds the set of image IDs to rerank.
+ * @return A vector of reranked search results.
+ */
+vector<SearchResult> ImageReranker::rerankCommon(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
+                                               unordered_map<u_int32_t, const vector<Hit>* > &indexHits,
+                                               unordered_set<u_int32_t> &firstImageIds)
 {
-    unordered_set<u_int32_t> firstImageIds;
-
-    // Extract the first i_nbResults ranked images.
-    getFirstImageIds(rankedResultsIn, i_nbResults, firstImageIds);
-
-    unordered_map<u_int32_t, RANSACTask> imgTasks;
+    // Use PointPairs instead of RANSACTask
+    unordered_map<u_int32_t, PointPairs> imgPointPairs;
 
     // Compute the histograms.
     unordered_map<u_int32_t, Histogram> histograms; // key: the image id, value: the corresponding histogram.
+    
+    unsigned totalMatches = 0;
+    unsigned totalHistogramEntries = 0;
+    unsigned totalPointPairs = 0;
 
     for (unordered_map<u_int32_t, list<Hit> >::const_iterator it = imagesReqHits.begin();
          it != imagesReqHits.end(); ++it)
@@ -92,15 +107,24 @@ void ImageReranker::rerank(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
         // If there is several hits for the same word in the image...
         const u_int16_t i_angle1 = hits.front().i_angle;
         const Point2f point1(hits.front().x, hits.front().y);
-        const vector<Hit> &hitIndex = indexHits[i_wordId];
+        const vector<Hit> *hitIndex = indexHits[i_wordId];
+        
+        if (!hitIndex) {
+            continue;
+        }
+        
+        unsigned matchesForThisWord = 0;
 
-        for (unsigned i = 0; i < hitIndex.size(); ++i)
+        for (unsigned i = 0; i < hitIndex->size(); ++i)
         {
-            const u_int32_t i_imageId = hitIndex[i].i_imageId;
+            const u_int32_t i_imageId = (*hitIndex)[i].i_imageId;
             // Test if the image belongs to the image to rerank.
             if (firstImageIds.find(i_imageId) != firstImageIds.end())
             {
-                const u_int16_t i_angle2 = hitIndex[i].i_angle;
+                matchesForThisWord++;
+                totalMatches++;
+                
+                const u_int16_t i_angle2 = (*hitIndex)[i].i_angle;
                 float f_diff = angleDiff(i_angle1, i_angle2);
                 unsigned bin = (f_diff - DIFF_MIN) / 360 * HISTOGRAM_NB_BINS;
                 assert(bin < HISTOGRAM_NB_BINS);
@@ -108,45 +132,77 @@ void ImageReranker::rerank(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
                 Histogram &histogram = histograms[i_imageId];
                 histogram.bins[bin]++;
                 histogram.i_total++;
+                totalHistogramEntries++;
 
-                const Point2f point2(hitIndex[i].x, hitIndex[i].y);
-                RANSACTask &imgTask = imgTasks[i_imageId];
+                const Point2f point2((*hitIndex)[i].x, (*hitIndex)[i].y);
+                PointPairs &pointPairs = imgPointPairs[i_imageId];
 
-                imgTask.points1.push_back(point1);
-                imgTask.points2.push_back(point2);
+                pointPairs.points1.push_back(point1);
+                pointPairs.points2.push_back(point2);
+                totalPointPairs++;
             }
+        }
+        
+        // Debug output removed to improve performance
+    }
+
+    // Create a vector to store the results
+    vector<SearchResult> rankedResults;
+    rankedResults.reserve(histograms.size()); // Reserve space for efficiency
+
+    // Process all images in a single thread
+    unsigned ransacAttempts = 0;
+    unsigned successfulRansacs = 0;
+    unsigned skippedDueToLowValue = 0;
+    unsigned skippedDueToFewPoints = 0;
+    unsigned skippedDueToZeroH = 0;
+    
+    // Rank the images according to their histogram.
+    for (const auto& histogramPair : histograms)
+    {
+        const unsigned i_imageId = histogramPair.first;
+        const Histogram& histogram = histogramPair.second;
+        
+        // Find the maximum bin value
+        unsigned i_binMax = max_element(histogram.bins, histogram.bins + HISTOGRAM_NB_BINS) - histogram.bins;
+        float i_maxVal = histogram.bins[i_binMax];
+        
+        if (i_maxVal > 10)
+        {
+            const PointPairs& pointPairs = imgPointPairs[i_imageId];
+            assert(pointPairs.points1.size() == pointPairs.points2.size());
+
+            if (pointPairs.points1.size() >= RANSAC_MIN_INLINERS)
+            {
+                ransacAttempts++;                
+                Mat H = RANSACHelper::pastecEstimateRigidTransform(pointPairs.points2, pointPairs.points1, true);
+
+                if (countNonZero(H) == 0) {
+                    skippedDueToZeroH++;
+                    continue;
+                }
+
+                Rect bRect1 = boundingRect(pointPairs.points1);
+                rankedResults.push_back(SearchResult(i_maxVal, i_imageId, bRect1));
+                
+                successfulRansacs++;
+            }
+            else {
+                skippedDueToFewPoints++;
+            }
+        }
+        else {
+            skippedDueToLowValue++;
         }
     }
 
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    #define NB_RANSAC_THREAD 4
-    RANSACThread *threads[NB_RANSAC_THREAD];
-
-    for (unsigned i = 0; i < NB_RANSAC_THREAD; ++i)
-        threads[i] = new RANSACThread(mutex, imgTasks, rankedResultsOut);
-
-    // Rank the images according to their histogram.
-    unsigned i = 0;
-    for (unordered_map<unsigned, Histogram>::iterator it = histograms.begin();
-         it != histograms.end(); ++it, ++i)
-    {
-        unsigned i_imageId = it->first;
-        Histogram histogram = it->second;
-        threads[i % NB_RANSAC_THREAD]->imageIds.push_back(i_imageId);
-        threads[i % NB_RANSAC_THREAD]->histograms.push_back(histogram);
-    }
-
-    // Compute
-    for (unsigned i = 0; i < NB_RANSAC_THREAD; ++i)
-        threads[i]->start();
-    for (unsigned i = 0; i < NB_RANSAC_THREAD; ++i)
-    {
-        threads[i]->join();
-        delete threads[i];
-    }
-
-    pthread_mutex_destroy(&mutex);
+    // Sort the results by weight in descending order
+    sort(rankedResults.begin(), rankedResults.end(), 
+         [](const SearchResult& a, const SearchResult& b) {
+             return a.f_weight > b.f_weight;
+         });
+    
+    return rankedResults;
 }
 
 
@@ -167,25 +223,134 @@ private:
 
 
 /**
- * @brief Return the first ids of ranked images.
- * @param rankedResultsIn the ranked images.
- * @param i_nbResults the number of images to return.
- * @param firstImageIds a set to return the image ids.
+ * @brief Rerank images using the forward index for better performance.
+ * @param imagesReqHits the hits of the request image.
+ * @param index the ORB index with forward index.
+ * @param firstImageIds the set of image IDs to rerank.
+ * @return A vector of reranked search results.
  */
-void ImageReranker::getFirstImageIds(priority_queue<SearchResult> &rankedResultsIn,
-                                     unsigned i_nbResults, unordered_set<u_int32_t> &firstImageIds)
-{
-    unsigned i_res = 0;
-    while(!rankedResultsIn.empty()
-          && i_res < i_nbResults)
-    {
-        const SearchResult &res = rankedResultsIn.top();
-        firstImageIds.insert(res.i_imageId);
-        rankedResultsIn.pop();
-        i_res++;
+vector<SearchResult> ImageReranker::rerankUsingForwardIndex(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
+                                                          ORBIndex* index,
+                                                          unordered_set<u_int32_t> &firstImageIds)
+{    
+    // Create a map of query words for fast lookup
+    unordered_map<u_int32_t, Hit> queryWords;
+    for (const auto& pair : imagesReqHits) {
+        queryWords[pair.first] = pair.second.front();
     }
-}
+    
+    // Use PointPairs instead of RANSACTask
+    unordered_map<u_int32_t, PointPairs> imgPointPairs;
+    
+    // Compute the histograms
+    unordered_map<u_int32_t, Histogram> histograms;
+    
+    unsigned totalMatches = 0;
+    unsigned totalHistogramEntries = 0;
+    unsigned totalPointPairs = 0;
+    
+    // Process each image in the reranking set
+    for (const u_int32_t i_imageId : firstImageIds) {
+        // Get all words for this image from the forward index
+        const vector<unsigned>& imageWords = index->getForwardIndexWords(i_imageId);
+        
+        // For each word in this image
+        for (const unsigned i_wordId : imageWords) {
+            // Check if this word exists in the query image
+            auto queryIt = queryWords.find(i_wordId);
+            if (queryIt == queryWords.end()) {
+                continue;  // Word not in query, skip
+            }
+            
+            // Get the hit from the index for this word and image
+            const Hit* indexHit = index->getHitForWordAndImage(i_wordId, i_imageId);
+            if (!indexHit) {
+                continue;  // No hit found, skip
+            }
+            
+            totalMatches++;
+            
+            // Calculate angle difference
+            const u_int16_t i_angle1 = queryIt->second.i_angle;
+            const u_int16_t i_angle2 = indexHit->i_angle;
+            float f_diff = angleDiff(i_angle1, i_angle2);
+            unsigned bin = (f_diff - DIFF_MIN) / 360 * HISTOGRAM_NB_BINS;
+            assert(bin < HISTOGRAM_NB_BINS);
+            
+            // Update histogram
+            Histogram &histogram = histograms[i_imageId];
+            histogram.bins[bin]++;
+            histogram.i_total++;
+            totalHistogramEntries++;
+            
+            // Store point pairs for RANSAC
+            const Point2f point1(queryIt->second.x, queryIt->second.y);
+            const Point2f point2(indexHit->x, indexHit->y);
+            PointPairs &pointPairs = imgPointPairs[i_imageId];
+            
+            pointPairs.points1.push_back(point1);
+            pointPairs.points2.push_back(point2);
+            totalPointPairs++;
+        }
+    }
+    
+    // Create a vector to store the results
+    vector<SearchResult> rankedResults;
+    rankedResults.reserve(histograms.size()); // Reserve space for efficiency
 
+    // Process all images in a single thread
+    unsigned ransacAttempts = 0;
+    unsigned successfulRansacs = 0;
+    unsigned skippedDueToLowValue = 0;
+    unsigned skippedDueToFewPoints = 0;
+    unsigned skippedDueToZeroH = 0;
+    
+    // Rank the images according to their histogram.
+    for (const auto& histogramPair : histograms)
+    {
+        const unsigned i_imageId = histogramPair.first;
+        const Histogram& histogram = histogramPair.second;
+        
+        // Find the maximum bin value
+        unsigned i_binMax = max_element(histogram.bins, histogram.bins + HISTOGRAM_NB_BINS) - histogram.bins;
+        float i_maxVal = histogram.bins[i_binMax];
+        
+        if (i_maxVal > 10)
+        {
+            const PointPairs& pointPairs = imgPointPairs[i_imageId];
+            assert(pointPairs.points1.size() == pointPairs.points2.size());
+
+            if (pointPairs.points1.size() >= RANSAC_MIN_INLINERS)
+            {
+                ransacAttempts++;                
+                Mat H = RANSACHelper::pastecEstimateRigidTransform(pointPairs.points2, pointPairs.points1, true);                
+                if (countNonZero(H) == 0) {
+                    skippedDueToZeroH++;
+                    continue;
+                }
+
+                Rect bRect1 = boundingRect(pointPairs.points1);
+                rankedResults.push_back(SearchResult(i_maxVal, i_imageId, bRect1));
+                
+                successfulRansacs++;                
+            }
+            else {
+                skippedDueToFewPoints++;
+            }
+        }
+        else {
+            skippedDueToLowValue++;
+        }
+    }
+    
+    // Sort the results by weight in descending order
+    sort(rankedResults.begin(), rankedResults.end(), 
+         [](const SearchResult& a, const SearchResult& b) {
+             return a.f_weight > b.f_weight;
+         });
+    
+    return rankedResults;
+}
 
 float ImageReranker::angleDiff(unsigned i_angle1, unsigned i_angle2)
 {

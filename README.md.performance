@@ -1,0 +1,110 @@
+# Pastec Performance Optimizations
+
+This document outlines the performance optimizations applied to Pastec based on the article about improving C++ build performance.
+
+## Optimizations Implemented
+
+1. **Enhanced Compiler Flags**
+   - Added `-O3` for maximum optimization (instead of default `-O2`)
+   - Added `-flto` for Link Time Optimization
+   - Added `-DNDEBUG` to disable assertions in Release mode
+   - Added `-march=native` to optimize for the specific CPU architecture
+   - Added `-ffunction-sections` and `-fdata-sections` with `-Wl,--gc-sections` to remove unused code
+
+2. **Switched to Clang Compiler**
+   - Updated Dockerfile to use clang instead of gcc
+   - Added lld as the linker
+
+3. **Added mimalloc Memory Allocator**
+   - Added support for mimalloc, which has shown to be significantly faster than the default glibc allocator
+   - Created a FindMimalloc.cmake module to detect and use mimalloc
+   - Updated CMakeLists.txt to link against mimalloc when available
+
+4. **Enabled Transparent Huge Pages**
+   - Added environment variables in Dockerfile and docker-compose.yml:
+     - `MIMALLOC_LARGE_OS_PAGES=1`
+     - `MALLOC_CONF="thp:always,metadata_thp:always"`
+     - `GLIBC_TUNABLES=glibc.malloc.hugetlb=1"`
+
+## How to Use These Optimizations
+
+### Building with Optimizations
+
+Simply build the project as usual:
+
+```bash
+mkdir -p build && cd build
+cmake ../
+make -j$(nproc)
+```
+
+If you have clang installed, you can explicitly use it:
+
+```bash
+mkdir -p build && cd build
+CC=clang CXX=clang++ cmake ../
+make -j$(nproc)
+```
+
+### Using Docker
+
+The Dockerfile has been updated to include all optimizations. Build and run with:
+
+```bash
+docker build -t pastec .
+docker run -p 4212:4212 pastec
+```
+
+Or use docker-compose:
+
+```bash
+docker-compose up -d
+```
+
+### Using mimalloc with Existing Binaries
+
+If you don't want to rebuild Pastec, you can use the provided script to run an existing binary with mimalloc:
+
+```bash
+# First, install mimalloc
+sudo apt-get install libmimalloc-dev
+
+# Then run Pastec with mimalloc preloaded
+./run-with-mimalloc.sh -p 4212 /path/to/visualWordsORB.dat
+```
+
+Alternatively, you can manually preload mimalloc:
+
+```bash
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so ./pastec -p 4212 /path/to/visualWordsORB.dat
+```
+
+## Expected Performance Improvements
+
+Based on the article, you can expect:
+
+1. **Compiler Optimizations**: 20-25% improvement
+2. **mimalloc Memory Allocator**: 30-40% improvement
+3. **Combined Optimizations**: Potentially up to 90% improvement in some workloads
+
+The actual performance improvement will depend on your specific workload and hardware. The most significant gains will likely be seen in memory-intensive operations like batch processing of images.
+
+## Benchmarking
+
+To measure the performance improvement, you can use tools like `hyperfine` or `time`:
+
+```bash
+# Install hyperfine
+sudo apt-get install hyperfine
+
+# Benchmark the original binary
+hyperfine --warmup 1 --runs 3 "./original-pastec -p 4212 /path/to/visualWordsORB.dat"
+
+# Benchmark the optimized binary
+hyperfine --warmup 1 --runs 3 "./optimized-pastec -p 4212 /path/to/visualWordsORB.dat"
+
+# Or benchmark with mimalloc preloaded
+hyperfine --warmup 1 --runs 3 "LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libmimalloc.so ./pastec -p 4212 /path/to/visualWordsORB.dat"
+```
+
+For real-world performance testing, you might want to measure the time it takes to process a batch of images or perform searches on a large dataset.

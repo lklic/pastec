@@ -23,6 +23,10 @@
 #define PASTEC_BACKWARDINDEXREADERACCESS_H
 
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <cstring>
 
@@ -159,6 +163,121 @@ private:
     char *p_indexData;
     u_int64_t i_fileSize;
     u_int64_t i_curPos;
+};
+
+/**
+ * Memory-mapped file access for the backward index.
+ * This provides zero-copy access to the file data through the OS's virtual memory system.
+ */
+class BackwardIndexReaderMMapAccess : public BackwardIndexReaderAccess
+{
+public:
+    BackwardIndexReaderMMapAccess() : fd(-1), mappedData(nullptr), i_fileSize(0), i_curPos(0) {}
+    
+    virtual bool open(string indexPath)
+    {
+        // Open the file
+        fd = ::open(indexPath.c_str(), O_RDONLY);
+        if (fd == -1)
+        {
+            cout << "Could not open the backward index file." << endl;
+            return false;
+        }
+
+        // Get file size
+        struct stat sb;
+        if (fstat(fd, &sb) == -1)
+        {
+            cout << "Could not get file size." << endl;
+            ::close(fd);
+            fd = -1;
+            return false;
+        }
+        i_fileSize = sb.st_size;
+
+        // Map the file into memory
+        mappedData = mmap(NULL, i_fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (mappedData == MAP_FAILED)
+        {
+            cout << "Could not memory map the index file." << endl;
+            ::close(fd);
+            fd = -1;
+            mappedData = nullptr;
+            return false;
+        }
+
+        // Advise the kernel that we'll access the data sequentially
+        madvise(mappedData, i_fileSize, MADV_SEQUENTIAL);
+        
+        i_curPos = 0;
+        return true;
+    }
+
+    virtual void moveAt(u_int64_t pos)
+    {
+        i_curPos = pos;
+    }
+
+    virtual void read(char *p_data, unsigned i_nbBytes)
+    {
+        if (i_curPos + i_nbBytes <= i_fileSize)
+        {
+            memcpy(p_data, static_cast<char*>(mappedData) + i_curPos, i_nbBytes);
+            i_curPos += i_nbBytes;
+        }
+    }
+
+    virtual bool endOfIndex()
+    {
+        return i_curPos >= i_fileSize;
+    }
+
+    virtual void reset()
+    {
+        i_curPos = 0;
+    }
+
+    virtual void close()
+    {
+        if (mappedData != nullptr && mappedData != MAP_FAILED)
+        {
+            munmap(mappedData, i_fileSize);
+            mappedData = nullptr;
+        }
+        
+        if (fd != -1)
+        {
+            ::close(fd);
+            fd = -1;
+        }
+        
+        i_fileSize = 0;
+        i_curPos = 0;
+    }
+
+    // Get direct pointer to the mapped data at current position
+    char* getCurrentDataPtr() const
+    {
+        return static_cast<char*>(mappedData) + i_curPos;
+    }
+    
+    // Get direct pointer to the mapped data at specified offset
+    char* getDataPtr(u_int64_t offset) const
+    {
+        return static_cast<char*>(mappedData) + offset;
+    }
+    
+    // Get file size
+    u_int64_t getFileSize() const
+    {
+        return i_fileSize;
+    }
+
+private:
+    int fd;                 // File descriptor
+    void* mappedData;       // Pointer to memory-mapped data
+    u_int64_t i_fileSize;   // Size of the file
+    u_int64_t i_curPos;     // Current position in the file
 };
 
 #endif // PASTEC_BACKWARDINDEXREADERACCESS_H

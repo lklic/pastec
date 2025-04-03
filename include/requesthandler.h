@@ -24,6 +24,7 @@
 
 #include <httpserver.h>
 #include <imagedownloader.h>
+#include <batchprocessor.h>
 
 class FeatureExtractor;
 class Searcher;
@@ -42,6 +43,7 @@ public:
     RequestHandler(FeatureExtractor *featureExtractor,
                    Searcher *imageSearcher, Index *index,
                    ImageDownloader *imgDownloader, string authKey);
+    ~RequestHandler();
     void handleRequest(ConnectionInfo &conInfo);
 
 private:
@@ -49,11 +51,13 @@ private:
     bool testURIWithPattern(vector<string> parsedURI, string p_pattern[]);
     string JsonToString(Json::Value data);
     Json::Value StringToJson(string str);
+    unsigned long getTimeDiff(const timeval t1, const timeval t2) const;
 
     FeatureExtractor *featureExtractor;
     Searcher *imageSearcher;
     Index *index;
     ImageDownloader *imgDownloader;
+    BatchProcessor *batchProcessor;
 
     string authKey;
 };

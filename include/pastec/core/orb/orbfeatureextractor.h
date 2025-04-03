@@ -29,16 +29,11 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/features2d/features2d.hpp>
 
-#include <orbindex.h>
-#include <orbwordindex.h>
-#include <featureextractor.h>
+#include "pastec/core/featureextractor.h"
+#include "pastec/core/orb/orbindex.h"
+#include "pastec/core/orb/orbwordindex.h"
 
-class ClientConnection;
-
-
-using namespace cv;
-using namespace std;
-
+namespace pastec {
 
 class ORBFeatureExtractor : public FeatureExtractor
 {
@@ -51,13 +46,15 @@ public:
     
     // Extract features without adding to index (for batch processing)
     u_int32_t extractFeatures(unsigned i_imageId, unsigned i_imgSize,
-                             char *p_imgData, list<HitForward> &hits,
+                             char *p_imgData, std::list<HitForward> &hits,
                              unsigned &i_nbFeaturesExtracted);
 
 private:
     ORBIndex *index;
     ORBWordIndex *wordIndex;
-    Ptr<ORB> orb;
+    cv::Ptr<cv::ORB> orb;
 };
+
+} // namespace pastec
 
 #endif // PASTEC_ORBFEATUREEXTRACTOR_H

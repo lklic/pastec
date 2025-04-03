@@ -31,8 +31,9 @@
 #include <messages.h>
 
 
-ORBIndex::ORBIndex(string indexPath, bool buildForwardIndex)
-    : buildForwardIndex(buildForwardIndex)
+ORBIndex::ORBIndex(string indexPath, string tagsPath, bool buildForwardIndex)
+    : buildForwardIndex(buildForwardIndex), totalNbRecords(0), m_totalIndexedImages(0),
+      storedIndexPath(indexPath), storedTagsPath(tagsPath)
 {
     // Init the mutex.
     pthread_rwlock_init(&rwLock, NULL);
@@ -42,6 +43,8 @@ ORBIndex::ORBIndex(string indexPath, bool buildForwardIndex)
         nbOccurences[i] = 0;
 
     load(indexPath);
+    loadTags(tagsPath);
+    cout << "DEBUG: Index initialized with " << nbWords.size() << endl;
 }
 
 
@@ -52,10 +55,9 @@ ORBIndex::ORBIndex(string indexPath, bool buildForwardIndex)
  */
 unsigned ORBIndex::getWordNbOccurences(unsigned i_wordId)
 {
-    pthread_rwlock_rdlock(&rwLock);
+    // No locks needed since the index is read-only during queries
     assert(i_wordId < NB_VISUAL_WORDS);
     unsigned i_ret = nbOccurences[i_wordId];
-    pthread_rwlock_unlock(&rwLock);
     return i_ret;
 }
 
@@ -67,18 +69,20 @@ ORBIndex::~ORBIndex()
 
 
 void ORBIndex::getImagesWithVisualWords(unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
-                                     unordered_map<u_int32_t, vector<Hit> > &indexHitsForReq)
+                                     unordered_map<u_int32_t, const vector<Hit>* > &indexHitsForReq)
 {
-    pthread_rwlock_rdlock(&rwLock);
-
+    // Pre-allocate memory for the result to avoid reallocations
+    indexHitsForReq.reserve(imagesReqHits.size());
+    
+    // No locks needed since the index is read-only during queries
     for (unordered_map<u_int32_t, list<Hit> >::const_iterator it = imagesReqHits.begin();
          it != imagesReqHits.end(); ++it)
     {
         const unsigned i_wordId = it->first;
-        indexHitsForReq[i_wordId] = indexHits[i_wordId];
+        
+        // Direct access without locks - store pointer to original data instead of copying
+        indexHitsForReq[i_wordId] = &indexHits[i_wordId];
     }
-
-    pthread_rwlock_unlock(&rwLock);
 }
 
 
@@ -86,21 +90,41 @@ void ORBIndex::getImagesWithVisualWords(unordered_map<u_int32_t, list<Hit> > &im
  * @brief Return the number of words for an image
  * @param i_imageId the image id.
  * @return the number of words.
- * readLock() and unlock MUST be called before and after calling this function.
+ * No locks needed since the index is read-only during queries.
  */
 unsigned ORBIndex::countTotalNbWord(unsigned i_imageId)
 {
+    // Make sure the image ID is within bounds
+    if (i_imageId >= nbWords.size())
+        return 0;
+    
     unsigned i_ret = nbWords[i_imageId];
     return i_ret;
 }
 
 
+/**
+ * @brief Recalculate the total number of indexed images.
+ * This method counts the number of images that have at least one word in the index.
+ */
+void ORBIndex::recalculateTotalIndexedImages()
+{
+    m_totalIndexedImages = 0;
+    for (const auto& wordCount : nbWords) {
+        if (wordCount > 0) {
+            m_totalIndexedImages++;
+        }
+    }
+}
+
+/**
+ * @brief Return the total number of indexed images.
+ * @return the number of images that have at least one word in the index.
+ */
 unsigned ORBIndex::getTotalNbIndexedImages()
 {
-    pthread_rwlock_rdlock(&rwLock);
-    unsigned i_ret = nbWords.size();
-    pthread_rwlock_unlock(&rwLock);
-    return i_ret;
+    // No locks needed since the index is read-only during queries
+    return m_totalIndexedImages;
 }
 
 
@@ -111,11 +135,24 @@ unsigned ORBIndex::getTotalNbIndexedImages()
 u_int32_t ORBIndex::addImage(unsigned i_imageId, list<HitForward> hitList)
 {
     pthread_rwlock_wrlock(&rwLock);
-    if (nbWords.find(i_imageId) != nbWords.end())
+    
+    // Check if image already exists
+    if (i_imageId < nbWords.size() && nbWords[i_imageId] > 0)
     {
         pthread_rwlock_unlock(&rwLock);
         removeImage(i_imageId);
         pthread_rwlock_wrlock(&rwLock);
+    }
+    
+    // Ensure vectors have sufficient capacity
+    if (i_imageId >= nbWords.size())
+    {
+        nbWords.resize(i_imageId + 1, 0);
+        if (buildForwardIndex)
+        {
+            forwardIndex.resize(i_imageId + 1);
+        }
+        tags.resize(i_imageId + 1);
     }
 
     for (list<HitForward>::iterator it = hitList.begin(); it != hitList.end(); ++it)
@@ -137,6 +174,8 @@ u_int32_t ORBIndex::addImage(unsigned i_imageId, list<HitForward> hitList)
         nbOccurences[hitFor.i_wordId]++;
         totalNbRecords++;
     }
+    updateIndexState();
+    
     pthread_rwlock_unlock(&rwLock);
 
     if (!hitList.empty())
@@ -144,6 +183,95 @@ u_int32_t ORBIndex::addImage(unsigned i_imageId, list<HitForward> hitList)
              << hitList.size() << " hits." << endl;
 
     return IMAGE_ADDED;
+}
+
+/**
+ * @brief Add multiple images to the index in a single transaction.
+ * @param batchHits map of image IDs to their respective hit lists.
+ * @return IMAGE_ADDED on success.
+ */
+u_int32_t ORBIndex::addBatchImages(const unordered_map<u_int32_t, list<HitForward>>& batchHits)
+{
+    pthread_rwlock_wrlock(&rwLock);
+    
+    // Find maximum image ID to ensure array capacity
+    u_int32_t maxImageId = 0;
+    for (const auto& pair : batchHits) {
+        maxImageId = std::max(maxImageId, pair.first);
+    }
+    
+    // Ensure vectors have sufficient capacity
+    if (maxImageId >= nbWords.size()) {
+        nbWords.resize(maxImageId + 1, 0);
+        if (buildForwardIndex) {
+            forwardIndex.resize(maxImageId + 1);
+        }
+        tags.resize(maxImageId + 1);
+    }
+    
+    // Add all the new hits
+    for (const auto& pair : batchHits) {
+        u_int32_t imageId = pair.first;
+        const list<HitForward>& hitList = pair.second;
+        
+        for (const HitForward& hitFor : hitList) {
+            assert(imageId == hitFor.i_imageId);
+            Hit hitBack;
+            hitBack.i_imageId = hitFor.i_imageId;
+            hitBack.i_angle = hitFor.i_angle;
+            hitBack.x = hitFor.x;
+            hitBack.y = hitFor.y;
+            
+            if (buildForwardIndex) {
+                forwardIndex[hitFor.i_imageId].push_back(hitFor.i_wordId);
+            }
+            indexHits[hitFor.i_wordId].push_back(hitBack);
+            nbWords[hitFor.i_imageId]++;
+            nbOccurences[hitFor.i_wordId]++;
+            totalNbRecords++;
+        }
+    }
+    
+    updateIndexState();
+    
+    pthread_rwlock_unlock(&rwLock);
+    
+    return IMAGE_ADDED;
+}
+
+/**
+ * @brief Add multiple tags to images in a single transaction.
+ * @param batchTags map of image IDs to their respective tags.
+ * @return IMAGE_TAG_ADDED on success.
+ */
+u_int32_t ORBIndex::addBatchTags(const unordered_map<u_int32_t, string>& batchTags)
+{
+    if (batchTags.empty()) {
+        cout << "DEBUG: No tags to add in batch" << endl;
+        return OK;
+    }
+    
+    pthread_rwlock_wrlock(&rwLock);
+    
+    // Find maximum image ID to ensure array capacity
+    u_int32_t maxImageId = 0;
+    for (const auto& pair : batchTags) {
+        maxImageId = std::max(maxImageId, pair.first);
+    }
+    
+    // Ensure tags vector has sufficient capacity
+    if (maxImageId >= tags.size()) {
+        tags.resize(maxImageId + 1);
+    }
+    
+    // Add all tags
+    for (const auto& pair : batchTags) {
+        tags[pair.first] = pair.second;
+    }
+    
+    pthread_rwlock_unlock(&rwLock);
+        
+    return IMAGE_TAG_ADDED;
 }
 
 
@@ -155,9 +283,15 @@ u_int32_t ORBIndex::addTag(const unsigned i_imageId, const string tag)
 {
     pthread_rwlock_wrlock(&rwLock);
 
-    if (nbWords.find(i_imageId) == nbWords.end()) {
+    // Check if image exists
+    if (i_imageId >= nbWords.size() || nbWords[i_imageId] == 0) {
         pthread_rwlock_unlock(&rwLock);
         return IMAGE_NOT_FOUND;
+    }
+
+    // Ensure tags vector has sufficient capacity
+    if (i_imageId >= tags.size()) {
+        tags.resize(i_imageId + 1);
     }
 
     tags[i_imageId] = tag;
@@ -181,33 +315,25 @@ u_int32_t ORBIndex::removeImage(const unsigned i_imageId)
     removeTag((u_int64_t)i_imageId);
 
     pthread_rwlock_wrlock(&rwLock);
-    unordered_map<u_int64_t, unsigned>::iterator imgIt =
-        nbWords.find(i_imageId);
-
-    if (imgIt == nbWords.end())
+    
+    // Check if image exists
+    if (i_imageId >= nbWords.size() || nbWords[i_imageId] == 0)
     {
         cout << "Image " << i_imageId << " not found." << endl;
         pthread_rwlock_unlock(&rwLock);
         return IMAGE_NOT_FOUND;
     }
 
-    nbWords.erase(imgIt);
+    // Set word count to 0 (effectively removing the image)
+    nbWords[i_imageId] = 0;
 
-    if (buildForwardIndex)
+    if (buildForwardIndex && i_imageId < forwardIndex.size())
     {
-        unordered_map<u_int64_t, vector<unsigned> >::iterator forwardIndexIt =
-            forwardIndex.find(i_imageId);
-
-        if (forwardIndexIt == forwardIndex.end())
-        {
-            cout << "Image " << i_imageId << " not found." << endl;
-            pthread_rwlock_unlock(&rwLock);
-            return IMAGE_NOT_FOUND;
-        }
-
-        forwardIndex.erase(forwardIndexIt);
+        // Clear the forward index for this image
+        forwardIndex[i_imageId].clear();
     }
 
+    // Remove hits from indexHits
     for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId)
     {
         vector<Hit> &hits = indexHits[i_wordId];
@@ -225,6 +351,7 @@ u_int32_t ORBIndex::removeImage(const unsigned i_imageId)
             ++it;
         }
     }
+    updateIndexState();    
     pthread_rwlock_unlock(&rwLock);
 
     cout << "Image " << i_imageId << " removed." << endl;
@@ -239,48 +366,38 @@ u_int32_t ORBIndex::removeImage(const unsigned i_imageId)
  */
 u_int32_t ORBIndex::getImageWords(unsigned i_imageId, unordered_map<u_int32_t, list<Hit> > &hitList)
 {
-    pthread_rwlock_wrlock(&rwLock);
-
+    // No locks needed since the index is read-only during queries
     const unsigned i_nbTotalIndexedImages = getTotalNbIndexedImages();
     const unsigned i_maxNbOccurences = i_nbTotalIndexedImages > 10000 ?
                                        0.15 * i_nbTotalIndexedImages
                                        : i_nbTotalIndexedImages;
 
-    unordered_map<u_int64_t, unsigned>::iterator imgIt =
-        nbWords.find(i_imageId);
-
-    if (imgIt == nbWords.end())
+    // Check if image exists
+    if (i_imageId >= nbWords.size() || nbWords[i_imageId] == 0)
     {
         cout << "Image " << i_imageId << " not found." << endl;
-        pthread_rwlock_unlock(&rwLock);
         return IMAGE_NOT_FOUND;
     }
 
-    if (buildForwardIndex)
+    if (buildForwardIndex && i_imageId < forwardIndex.size())
     {
-        vector<unsigned> &words = forwardIndex[i_imageId];
-        vector<unsigned>::iterator word_it = words.begin();
-
-        while (word_it != words.end())
+        const vector<unsigned> &words = forwardIndex[i_imageId];
+        
+        for (const unsigned i_wordId : words)
         {
-            unsigned i_wordId = *word_it;
-
             if (getWordNbOccurences(i_wordId) <= i_maxNbOccurences)
             {
                 vector<Hit> &hits = indexHits[i_wordId];
-                vector<Hit>::iterator hit_it = hits.begin();
-
-                while (hit_it != hits.end())
+                
+                for (const Hit &hit : hits)
                 {
-                    if (hit_it->i_imageId == i_imageId)
+                    if (hit.i_imageId == i_imageId)
                     {
-                        hitList[i_wordId].push_back(*hit_it);
+                        hitList[i_wordId].push_back(hit);
                         break;
                     }
-                    ++hit_it;
                 }
             }
-            ++word_it;
         }
     }
     else
@@ -288,24 +405,20 @@ u_int32_t ORBIndex::getImageWords(unsigned i_imageId, unordered_map<u_int32_t, l
         for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId)
         {
             vector<Hit> &hits = indexHits[i_wordId];
-            vector<Hit>::iterator it = hits.begin();
-
-            while (it != hits.end())
+            
+            for (const Hit &hit : hits)
             {
-                if (it->i_imageId == i_imageId)
+                if (hit.i_imageId == i_imageId)
                 {
                     if (getWordNbOccurences(i_wordId) <= i_maxNbOccurences)
                     {
-                        hitList[i_wordId].push_back(*it);
+                        hitList[i_wordId].push_back(hit);
                     }
                     break;
                 }
-                ++it;
             }
         }
     }
-
-    pthread_rwlock_unlock(&rwLock);
 
     cout << "Image " << i_imageId << " found with " << hitList.size() << " words." << endl;
 
@@ -320,15 +433,14 @@ u_int32_t ORBIndex::removeTag(const unsigned i_imageId)
 {
     pthread_rwlock_wrlock(&rwLock);
 
-    unordered_map<u_int32_t, string>::iterator tagIt =
-        tags.find(i_imageId);
-
-    if (tagIt == tags.end()) {
+    // Check if tag exists
+    if (i_imageId >= tags.size() || tags[i_imageId].empty()) {
         pthread_rwlock_unlock(&rwLock);
         return IMAGE_TAG_NOT_FOUND;
     }
 
-    tags.erase(tagIt);
+    // Clear the tag (set to empty string)
+    tags[i_imageId] = "";
 
     pthread_rwlock_unlock(&rwLock);
 
@@ -345,19 +457,14 @@ u_int32_t ORBIndex::removeTag(const unsigned i_imageId)
  */
 u_int32_t ORBIndex::getTag(const unsigned i_imageId, string &tag)
 {
-    pthread_rwlock_rdlock(&rwLock);
-
-    unordered_map<u_int32_t, string>::iterator tagIt =
-        tags.find(i_imageId);
-
-    if (tagIt == tags.end()) {
-        pthread_rwlock_unlock(&rwLock);
+    // No locks needed since the index is read-only during queries
+    
+    // Check if tag exists
+    if (i_imageId >= tags.size() || tags[i_imageId].empty()) {
         return IMAGE_TAG_NOT_FOUND;
     }
 
-    tag = tagIt->second;
-
-    pthread_rwlock_unlock(&rwLock);
+    tag = tags[i_imageId];
 
     return OK;
 }
@@ -371,7 +478,13 @@ u_int32_t ORBIndex::getTag(const unsigned i_imageId, string &tag)
 u_int32_t ORBIndex::write(string backwardIndexPath)
 {
     if (backwardIndexPath == "")
-        backwardIndexPath = DEFAULT_INDEX_PATH;
+    {
+        // If no path is provided, use the stored path from constructor
+        if (storedIndexPath != "")
+            backwardIndexPath = storedIndexPath;
+        else
+            backwardIndexPath = DEFAULT_INDEX_PATH;
+    }
 
     ofstream ofs;
 
@@ -419,6 +532,7 @@ u_int32_t ORBIndex::write(string backwardIndexPath)
 u_int32_t ORBIndex::clear()
 {
     pthread_rwlock_wrlock(&rwLock);
+    
     // Reset the nbOccurences table.
     for (unsigned i = 0; i < NB_VISUAL_WORDS; ++i)
     {
@@ -426,11 +540,16 @@ u_int32_t ORBIndex::clear()
         indexHits[i].clear();
     }
 
-    nbWords.clear();
-    forwardIndex.clear();
-    tags.clear();
+    // Clear vectors (but keep their capacity)
+    std::fill(nbWords.begin(), nbWords.end(), 0);
+    for (auto& words : forwardIndex) {
+        words.clear();
+    }
+    std::fill(tags.begin(), tags.end(), "");
 
     totalNbRecords = 0;
+    m_totalIndexedImages = 0; // Reset the cached count since all images are removed
+    
     pthread_rwlock_unlock(&rwLock);
 
     cout << "Index cleared." << endl;
@@ -446,91 +565,132 @@ u_int32_t ORBIndex::clear()
  */
 u_int32_t ORBIndex::load(string backwardIndexPath)
 {
-    u_int32_t i_ret;
-
-    // Open the file.
-    BackwardIndexReaderFileAccess indexAccess;
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    
+    cout << "Loading index from " << backwardIndexPath << endl;
+    
+    // Open the file using memory mapping for optimal performance
+    BackwardIndexReaderMMapAccess indexAccess;
     if (!indexAccess.open(backwardIndexPath))
     {
         cout << "Could not open the backward index file." << endl;
-        i_ret = INDEX_NOT_FOUND;
+        return INDEX_NOT_FOUND;
     }
-    else
-    {
-        clear();
-
-        pthread_rwlock_wrlock(&rwLock);
-
-        /* Read the table to know where are located the lines corresponding to each
-         * visual word. */
-        cout << "Reading the numbers of occurences." << endl;
-        u_int64_t *wordOffSet = new u_int64_t[NB_VISUAL_WORDS];
-        u_int64_t i_offset = NB_VISUAL_WORDS * sizeof(u_int64_t);
-        for (unsigned i = 0; i < NB_VISUAL_WORDS; ++i)
-        {
-            indexAccess.read((char *)(nbOccurences + i), sizeof(u_int64_t));
-            wordOffSet[i] = i_offset;
-            i_offset += nbOccurences[i] * BACKWARD_INDEX_ENTRY_SIZE;
+    
+    clear();
+    pthread_rwlock_wrlock(&rwLock);
+    
+    // Get direct pointer to the mapped data
+    char* mappedData = indexAccess.getDataPtr(0);
+    u_int64_t fileSize = indexAccess.getFileSize();
+    
+    cout << "File size: " << fileSize / (1024 * 1024) << " MB" << endl;
+    
+    // Read the occurrence counts (first part of the file)
+    cout << "Reading occurrence counts..." << endl;
+    memcpy(nbOccurences, mappedData, NB_VISUAL_WORDS * sizeof(u_int64_t));
+    
+    // Calculate total number of hits and prepare for single-pass processing
+    u_int64_t totalHits = 0;
+    for (unsigned i = 0; i < NB_VISUAL_WORDS; ++i) {
+        totalHits += nbOccurences[i];
+    }
+    
+    cout << "Total hits: " << totalHits << endl;
+    totalNbRecords = totalHits;
+    
+    // Pre-allocate memory for all hits
+    cout << "Pre-allocating memory for hits..." << endl;
+    for (unsigned i = 0; i < NB_VISUAL_WORDS; ++i) {
+        if (nbOccurences[i] > 0) {
+            indexHits[i].reserve(nbOccurences[i]);
         }
-
-        /* Count the number of words per image. */
-        cout << "Counting the number of words per image." << endl;
-        totalNbRecords = 0;
-        while (true)
-        {
-            u_int32_t i_imageId;
-            u_int16_t i_angle, x, y;
-            indexAccess.read((char *)&i_imageId, sizeof(u_int32_t));
-            if (indexAccess.endOfIndex())
+    }
+    
+    // Process all hits in a single pass
+    cout << "Processing hits in a single pass..." << endl;
+    
+    // Start after the occurrence counts
+    char* dataPtr = mappedData + NB_VISUAL_WORDS * sizeof(u_int64_t);
+    u_int32_t maxImageId = 0;
+    
+    // Create a vector to count hits per word ID (to ensure we don't exceed nbOccurences)
+    vector<u_int64_t> hitCounts(NB_VISUAL_WORDS, 0);
+    
+    // Process all hits
+    for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId) {
+        for (u_int64_t i = 0; i < nbOccurences[i_wordId]; ++i) {
+            // Direct struct access instead of individual reads
+            Hit hit;
+            memcpy(&hit.i_imageId, dataPtr, sizeof(u_int32_t));
+            dataPtr += sizeof(u_int32_t);
+            memcpy(&hit.i_angle, dataPtr, sizeof(u_int16_t));
+            dataPtr += sizeof(u_int16_t);
+            memcpy(&hit.x, dataPtr, sizeof(u_int16_t));
+            dataPtr += sizeof(u_int16_t);
+            memcpy(&hit.y, dataPtr, sizeof(u_int16_t));
+            dataPtr += sizeof(u_int16_t);
+            
+            // Update max image ID
+            maxImageId = std::max(maxImageId, hit.i_imageId);
+            
+            // Add hit to index
+            indexHits[i_wordId].push_back(hit);
+            hitCounts[i_wordId]++;
+            
+            // Ensure we don't exceed the array bounds
+            if (dataPtr - mappedData >= fileSize) {
+                cout << "Warning: Reached end of file before processing all expected hits" << endl;
                 break;
-            indexAccess.read((char *)&i_angle, sizeof(u_int16_t));
-            indexAccess.read((char *)&x, sizeof(u_int16_t));
-            indexAccess.read((char *)&y, sizeof(u_int16_t));
-            nbWords[i_imageId]++;
-            totalNbRecords++;
-        }
-
-        indexAccess.reset();
-
-        cout << "Loading the index in memory." << endl;
-
-        for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId)
-        {
-            indexAccess.moveAt(wordOffSet[i_wordId]);
-            vector<Hit> &hits = indexHits[i_wordId];
-
-            const unsigned i_nbOccurences = nbOccurences[i_wordId];
-            hits.resize(i_nbOccurences);
-
-            for (u_int64_t i = 0; i < i_nbOccurences; ++i)
-            {
-                u_int32_t i_imageId;
-                u_int16_t i_angle, x, y;
-                indexAccess.read((char *)&i_imageId, sizeof(u_int32_t));
-                indexAccess.read((char *)&i_angle, sizeof(u_int16_t));
-                indexAccess.read((char *)&x, sizeof(u_int16_t));
-                indexAccess.read((char *)&y, sizeof(u_int16_t));
-                hits[i].i_imageId = i_imageId;
-                hits[i].i_angle = i_angle;
-                hits[i].x = x;
-                hits[i].y = y;
-
-                if (buildForwardIndex)
-                {
-                    forwardIndex[i_imageId].push_back(i_wordId);
-                }
             }
         }
-
-        indexAccess.close();
-        delete[] wordOffSet;
-
-        pthread_rwlock_unlock(&rwLock);
-
-        i_ret = INDEX_LOADED;
+        
+        // Verify we read the expected number of hits
+        if (hitCounts[i_wordId] != nbOccurences[i_wordId]) {
+            cout << "Warning: Expected " << nbOccurences[i_wordId] << " hits for word " 
+                 << i_wordId << " but read " << hitCounts[i_wordId] << endl;
+        }
     }
-
-    return i_ret;
+    
+    cout << "Maximum image ID: " << maxImageId << endl;
+    
+    // Resize vectors based on max image ID
+    nbWords.resize(maxImageId + 1, 0);
+    if (buildForwardIndex) {
+        forwardIndex.resize(maxImageId + 1);
+    }
+    
+    // Count words per image and build forward index in a single pass
+    cout << "Counting words per image and building forward index..." << endl;
+    for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId) {
+        const vector<Hit>& hits = indexHits[i_wordId];
+        for (const Hit& hit : hits) {
+            // Count words per image
+            nbWords[hit.i_imageId]++;
+            
+            // Build forward index if needed
+            if (buildForwardIndex) {
+                forwardIndex[hit.i_imageId].push_back(i_wordId);
+            }
+        }
+    }
+    
+    // Close the memory-mapped file
+    indexAccess.close();
+    
+    // Update index state (recalculate total indexed images and sort word vectors)
+    updateIndexState();
+    
+    pthread_rwlock_unlock(&rwLock);
+    
+    gettimeofday(&end, NULL);
+    double elapsed = (end.tv_sec - start.tv_sec) + 
+                    (end.tv_usec - start.tv_usec) / 1000000.0;
+    
+    cout << "Index loaded in " << elapsed << " seconds." << endl;
+    
+    return INDEX_LOADED;
 }
 
 
@@ -541,41 +701,119 @@ u_int32_t ORBIndex::load(string backwardIndexPath)
  */
 u_int32_t ORBIndex::loadTags(string indexTagsPath)
 {
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    
     if (indexTagsPath == "")
         indexTagsPath = DEFAULT_INDEX_TAGS_PATH;
 
-    ifstream ifs;
-
-    ifs.open(indexTagsPath.c_str(), ios_base::binary);
-    if (!ifs.good())
+    cout << "Loading tags from " << indexTagsPath << endl;
+    
+    // Try to open the file using memory mapping
+    int fd = ::open(indexTagsPath.c_str(), O_RDONLY);
+    if (fd == -1)
     {
         cout << "Could not open the index tags file." << endl;
         return INDEX_TAGS_NOT_FOUND;
     }
-
-    pthread_rwlock_wrlock(&rwLock);
-
-    tags.clear();
-    while (true)
+    
+    // Get file size
+    struct stat sb;
+    if (fstat(fd, &sb) == -1)
     {
-        // Read the image tag.
-        u_int32_t i_imageId;
-        u_int32_t i_tagSize;
-        ifs.read((char *)&i_imageId, sizeof(u_int32_t));
-        if (ifs.eof())
-            break;
-        ifs.read((char *)&i_tagSize, sizeof(u_int32_t));
-        char psz_tag[i_tagSize];
-        ifs.read((char *)psz_tag, i_tagSize);
-
-        cout << i_imageId << " " << i_tagSize << " " << psz_tag << endl;
-
-        // Save it into the memory.
-        tags[i_imageId] = string(psz_tag);
+        cout << "Could not get file size." << endl;
+        ::close(fd);
+        return INDEX_TAGS_NOT_FOUND;
     }
-
+    
+    u_int64_t fileSize = sb.st_size;
+    if (fileSize == 0)
+    {
+        cout << "Tags file is empty." << endl;
+        ::close(fd);
+        return INDEX_TAGS_LOADED; // Empty file is not an error
+    }
+    
+    // Map the file into memory
+    void* mappedData = mmap(NULL, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mappedData == MAP_FAILED)
+    {
+        cout << "Could not memory map the tags file." << endl;
+        ::close(fd);
+        return INDEX_TAGS_NOT_FOUND;
+    }
+    
+    // Advise the kernel that we'll access the data sequentially
+    madvise(mappedData, fileSize, MADV_SEQUENTIAL);
+    
+    pthread_rwlock_wrlock(&rwLock);
+    
+    // First pass: find maximum image ID
+    char* dataPtr = static_cast<char*>(mappedData);
+    char* endPtr = dataPtr + fileSize;
+    u_int32_t maxImageId = 0;
+    
+    while (dataPtr < endPtr - sizeof(u_int32_t) * 2) // Need at least space for imageId and tagSize
+    {
+        u_int32_t i_imageId;
+        memcpy(&i_imageId, dataPtr, sizeof(u_int32_t));
+        dataPtr += sizeof(u_int32_t);
+        
+        u_int32_t i_tagSize;
+        memcpy(&i_tagSize, dataPtr, sizeof(u_int32_t));
+        dataPtr += sizeof(u_int32_t);
+        
+        // Skip tag content
+        dataPtr += i_tagSize;
+        
+        maxImageId = std::max(maxImageId, i_imageId);
+        
+        // Check if we've reached the end of the file
+        if (dataPtr >= endPtr)
+            break;
+    }
+    
+    cout << "Maximum tag image ID: " << maxImageId << endl;
+    
+    // Ensure tags vector has sufficient capacity
+    tags.resize(maxImageId + 1);
+    
+    // Second pass: load the actual tags
+    dataPtr = static_cast<char*>(mappedData);
+    
+    while (dataPtr < endPtr - sizeof(u_int32_t) * 2)
+    {
+        u_int32_t i_imageId;
+        memcpy(&i_imageId, dataPtr, sizeof(u_int32_t));
+        dataPtr += sizeof(u_int32_t);
+        
+        u_int32_t i_tagSize;
+        memcpy(&i_tagSize, dataPtr, sizeof(u_int32_t));
+        dataPtr += sizeof(u_int32_t);
+        
+        // Read tag content
+        if (dataPtr + i_tagSize <= endPtr) {
+            tags[i_imageId] = string(dataPtr, i_tagSize - 1); // Subtract 1 to exclude null terminator
+        } else {
+            cout << "Warning: Tag data for image " << i_imageId << " extends beyond file end" << endl;
+            break;
+        }
+        
+        dataPtr += i_tagSize;
+    }
+    
+    // Unmap and close the file
+    munmap(mappedData, fileSize);
+    ::close(fd);
+    
     pthread_rwlock_unlock(&rwLock);
-
+    
+    gettimeofday(&end, NULL);
+    double elapsed = (end.tv_sec - start.tv_sec) + 
+                    (end.tv_usec - start.tv_usec) / 1000000.0;
+    
+    cout << "Tags loaded in " << elapsed << " seconds." << endl;
+    
     return INDEX_TAGS_LOADED;
 }
 
@@ -588,7 +826,13 @@ u_int32_t ORBIndex::loadTags(string indexTagsPath)
 u_int32_t ORBIndex::writeTags(string indexTagsPath)
 {
     if (indexTagsPath == "")
-        indexTagsPath = DEFAULT_INDEX_TAGS_PATH;
+    {
+        // If no path is provided, use the stored path from constructor
+        if (storedTagsPath != "")
+            indexTagsPath = storedTagsPath;
+        else
+            indexTagsPath = DEFAULT_INDEX_TAGS_PATH;
+    }
 
     ofstream ofs;
 
@@ -603,17 +847,18 @@ u_int32_t ORBIndex::writeTags(string indexTagsPath)
 
     cout << "Writing the index image tags." << endl;
 
-    for (unordered_map<u_int32_t, string>::const_iterator it = tags.begin();
-         it != tags.end(); ++it)
+    // Write only non-empty tags
+    for (size_t i_imageId = 0; i_imageId < tags.size(); ++i_imageId)
     {
-        u_int32_t i_imageId = it->first;
-        const char *psz_tag = it->second.c_str();
-        u_int32_t i_tagSize = strlen(psz_tag) + 1;
+        if (!tags[i_imageId].empty())
+        {
+            const char *psz_tag = tags[i_imageId].c_str();
+            u_int32_t i_tagSize = strlen(psz_tag) + 1;
 
-        ofs.write((char *)(&i_imageId), sizeof(u_int32_t));
-        ofs.write((char *)(&i_tagSize), sizeof(u_int32_t));
-        ofs.write((char *)(psz_tag), i_tagSize);
-        cout << "plop!" << endl;
+            ofs.write((char *)(&i_imageId), sizeof(u_int32_t));
+            ofs.write((char *)(&i_tagSize), sizeof(u_int32_t));
+            ofs.write((char *)(psz_tag), i_tagSize);
+        }
     }
 
     ofs.close();
@@ -633,10 +878,24 @@ u_int32_t ORBIndex::writeTags(string indexTagsPath)
  */
 u_int32_t ORBIndex::getImageIds(vector<u_int32_t> &imageIds)
 {
-    imageIds.reserve(nbWords.size());
-    for (unordered_map<u_int64_t, unsigned>::const_iterator it = nbWords.begin();
-         it != nbWords.end(); ++it)
-        imageIds.push_back(it->first);
+    // No locks needed since the index is read-only during queries
+    
+    // Count non-zero entries first to reserve the right amount of space
+    unsigned count = 0;
+    for (size_t i = 0; i < nbWords.size(); ++i) {
+        if (nbWords[i] > 0) {
+            count++;
+        }
+    }
+    
+    imageIds.reserve(count);
+    
+    // Add all image IDs with non-zero word counts
+    for (size_t i = 0; i < nbWords.size(); ++i) {
+        if (nbWords[i] > 0) {
+            imageIds.push_back(i);
+        }
+    }
 
     return INDEX_IMAGE_IDS;
 }
@@ -657,4 +916,100 @@ void ORBIndex::readLock()
 void ORBIndex::unlock()
 {
     pthread_rwlock_unlock(&rwLock);
+}
+
+/**
+ * @brief Sort all word vectors by image ID.
+ * 
+ * This method sorts all word vectors by image ID to enable binary search
+ * in getHitForWordAndImage, improving lookup performance from O(n) to O(log n).
+ * Called after loading the index or modifying it (adding/removing images).
+ */
+void ORBIndex::sortAllWordVectors()
+{
+    for (unsigned i_wordId = 0; i_wordId < NB_VISUAL_WORDS; ++i_wordId) {
+        if (nbOccurences[i_wordId] > 0) {
+            std::sort(indexHits[i_wordId].begin(), indexHits[i_wordId].end(), 
+                     [](const Hit& a, const Hit& b) {
+                         return a.i_imageId < b.i_imageId;
+                     });
+        }
+    }
+}
+
+/**
+ * @brief Update the index state by recalculating total indexed images and sorting word vectors.
+ * 
+ * This method combines recalculateTotalIndexedImages() and sortAllWordVectors() since
+ * they are always called together after modifying the index.
+ */
+void ORBIndex::updateIndexState()
+{
+    recalculateTotalIndexedImages();
+    sortAllWordVectors();
+}
+
+/**
+ * @brief Get direct access to the word count vector.
+ * @return A const reference to the nbWords vector.
+ */
+const vector<unsigned>& ORBIndex::getWordCountVector() const
+{
+    return nbWords;
+}
+
+/**
+ * @brief Check if forward index is available.
+ * @return true if forward index is built, false otherwise.
+ */
+bool ORBIndex::hasForwardIndex() const
+{
+    return buildForwardIndex && !forwardIndex.empty();
+}
+
+/**
+ * @brief Get all words for an image from the forward index.
+ * @param i_imageId the image id.
+ * @return A const reference to the vector of word IDs for this image.
+ */
+const vector<unsigned>& ORBIndex::getForwardIndexWords(u_int32_t i_imageId) const
+{
+    static const vector<unsigned> emptyVector;
+    
+    if (!buildForwardIndex || i_imageId >= forwardIndex.size()) {
+        return emptyVector;
+    }
+    
+    return forwardIndex[i_imageId];
+}
+
+/**
+ * @brief Get a hit for a specific word and image.
+ * @param i_wordId the word id.
+ * @param i_imageId the image id.
+ * @return A pointer to the hit, or nullptr if not found.
+ * 
+ * This method uses binary search on the sorted vector of hits to find a hit
+ * for a specific word and image. This improves lookup performance from O(n) to O(log n).
+ * The vectors must be sorted by image ID using sortAllWordVectors() for this to work.
+ */
+const Hit* ORBIndex::getHitForWordAndImage(u_int32_t i_wordId, u_int32_t i_imageId) const
+{
+    if (i_wordId >= NB_VISUAL_WORDS) {
+        return nullptr;
+    }
+    
+    const vector<Hit>& hits = indexHits[i_wordId];
+    
+    // Use binary search on the sorted vector
+    auto it = std::lower_bound(hits.begin(), hits.end(), i_imageId, 
+                              [](const Hit& hit, u_int32_t id) { 
+                                  return hit.i_imageId < id; 
+                              });
+    
+    if (it != hits.end() && it->i_imageId == i_imageId) {
+        return &(*it);
+    }
+    
+    return nullptr;
 }

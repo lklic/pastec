@@ -38,6 +38,94 @@ docker compose up -d
 
 This will start Pastec on port 4212.
 
+#### Optimized Docker Build
+
+Pastec now uses an optimized Docker build process that leverages layer caching for faster rebuilds:
+
+1. Dependencies are built in a separate layer using `deps-flake.nix`
+2. The Pastec application is built in another layer using the main `flake.nix`
+3. When only Pastec code changes, Docker reuses the cached dependencies layer
+
+For more details on the build system, see [BUILD.md](BUILD.md).
+
+To build and run with the optimized setup:
+
+```bash
+# Enable BuildKit for better caching
+export DOCKER_BUILDKIT=1
+
+# Build and run
+docker-compose build
+docker-compose up -d
+```
+
+Or use the provided script:
+
+```bash
+./build-and-run.sh
+```
+
+### Using Nix
+
+Pastec now supports Nix for reproducible builds and development environments. This approach provides consistent environments across development, CI, and production.
+
+#### Prerequisites
+
+- Install Nix: `curl -L https://nixos.org/nix/install | sh`
+- Enable flakes: Add `experimental-features = nix-command flakes` to your Nix configuration (in `~/.config/nix/nix.conf` or `/etc/nix/nix.conf`)
+- This project uses the stable NixOS 24.11 channel
+
+#### Development Environment
+
+To enter a development shell with all dependencies:
+
+```bash
+nix develop
+```
+
+#### Building with Nix
+
+To build Pastec using Nix:
+
+```bash
+nix build
+```
+
+This will create a `result` symlink pointing to the built package.
+
+#### Running with Nix
+
+After building, you can run Pastec:
+
+```bash
+./result/bin/pastec -p 4212 ./visualWordsORB.dat
+```
+
+#### Docker with Nix
+
+The default Dockerfile now uses Nix to build Pastec, resulting in a minimal and reproducible Docker image with optimized layer caching:
+
+```bash
+# Enable BuildKit for better caching
+export DOCKER_BUILDKIT=1
+
+# Build the image
+docker build -t pastec .
+
+# Run the container
+docker run -p 4212:4212 pastec
+```
+
+For backward compatibility, the Ubuntu-based Dockerfile is still available as `Dockerfile.ubuntu`.
+
+To test the caching benefits, you can use the provided script:
+
+```bash
+./test-caching.sh
+```
+
+This script demonstrates how changes to Pastec code only rebuild the necessary layers, significantly reducing build time.
+
 ### Manual Compilation
 
 #### Dependencies
@@ -64,6 +152,92 @@ cd build
 cmake ../
 make
 ```
+
+### Using Pastec as a Library
+
+Pastec can now be used as a library in your C++ projects. This allows you to integrate Pastec's image recognition capabilities directly into your applications without using the HTTP API.
+
+#### Building the Library
+
+To build Pastec as a library:
+
+```bash
+git clone https://github.com/Visu4link/pastec.git
+cd pastec
+mkdir build
+cd build
+cmake ../
+make
+sudo make install
+```
+
+The library is always built by default. You can control other build options with these CMake flags:
+- `-DBUILD_PASTEC_EXE=ON|OFF`: Build Pastec executable with HTTP server (default: ON)
+- `-DBUILD_SHARED_LIBS=ON|OFF`: Build shared libraries instead of static (default: OFF)
+- `-DBUILD_EXAMPLES=ON|OFF`: Build example applications (default: ON)
+
+#### Using in CMake Projects
+
+After installing the library, you can use it in your CMake projects:
+
+```cmake
+find_package(Pastec REQUIRED)
+add_executable(myapp main.cpp)
+target_link_libraries(myapp Pastec::pastec)
+```
+
+#### Basic Usage Example
+
+```cpp
+#include <pastec/pastec.h>
+#include <iostream>
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <visual_words_path> <image_path>" << std::endl;
+        return 1;
+    }
+    
+    // Initialize index and searcher
+    pastec::ORBIndex index;
+    pastec::ORBWordIndex wordIndex(argv[1]);
+    pastec::ORBSearcher searcher(&index, &wordIndex);
+    pastec::ImageLoader imageLoader;
+    
+    // Load image
+    unsigned char* imageData;
+    unsigned long imageLength;
+    
+    if (!imageLoader.loadFile(argv[2], &imageData, &imageLength)) {
+        std::cerr << "Failed to load image" << std::endl;
+        return 1;
+    }
+    
+    // Add image to index
+    unsigned imageId = 1;
+    unsigned nbFeatures = 0;
+    pastec::ORBFeatureExtractor featureExtractor(&index, &wordIndex);
+    featureExtractor.processNewImage(imageId, imageLength, (char*)imageData, nbFeatures);
+    
+    // Search for the same image
+    pastec::SearchRequest request;
+    request.imageId = 0; // 0 means don't store the image
+    request.imageData.assign(imageData, imageData + imageLength);
+    
+    searcher.searchImage(request);
+    
+    // Print results
+    for (size_t i = 0; i < request.results.size(); i++) {
+        std::cout << "Found image ID: " << request.results[i]
+                  << " with score: " << request.scores[i] << std::endl;
+    }
+    
+    delete[] imageData;
+    return 0;
+}
+```
+
+For more examples, see the `examples` directory.
 
 ### Running
 
@@ -110,6 +284,64 @@ Example using URL:
 ```bash
 curl -X POST -d '{"url":"http://example.com/image.jpg"}' http://localhost:4212/index/images/23
 ```
+
+Example using local file URL:
+```bash
+curl -X POST -d '{"url":"file:///path/to/local/image.jpg"}' http://localhost:4212/index/images/23
+```
+
+> **Note:** When using the `file://` URL scheme with Docker, ensure that the directory containing your images is mounted as a volume in the container. For example: `docker run -v /path/on/host:/path/in/container pastec ...`
+
+### Batch processing images
+
+Process multiple images in a single request for improved performance. Optionally add tags during indexing.
+
+* **Path:** /index/images/batch
+* **HTTP method:** POST
+* **Data:** JSON array of objects with image_id, url, and optional tag
+* **Response:**
+```json
+{
+   "type": "BATCH_PROCESSED",
+   "results": [
+      {
+         "image_id": 23,
+         "url": "http://example.com/image1.jpg",
+         "type": "IMAGE_ADDED",
+         "nb_features_extracted": 542,
+         "tag": "example_tag",
+         "tag_status": "IMAGE_TAG_ADDED"
+      },
+      {
+         "image_id": 24,
+         "url": "http://example.com/image2.jpg",
+         "type": "IMAGE_ADDED",
+         "nb_features_extracted": 328
+      },
+      {
+         "image_id": 25,
+         "url": "http://invalid-url.com/image.jpg",
+         "type": "IMAGE_DOWNLOADER_HTTP_ERROR",
+         "image_downloader_http_response_code": 404
+      }
+   ]
+}
+```
+
+Example:
+```bash
+curl -X POST -d '[
+  {"image_id": 23, "url": "http://example.com/image1.jpg", "tag": "example_tag"},
+  {"image_id": 24, "url": "http://example.com/image2.jpg"},
+  {"image_id": 25, "url": "file:///path/to/local/image.jpg", "tag": "local_image"}
+]' http://localhost:4212/index/images/batch
+```
+
+The batch processing endpoint:
+- Processes images in parallel using multiple threads for better performance
+- Allows adding tags during initial indexing
+- Automatically writes indices to disk after batch operations
+- Returns detailed status for each image in the batch
 
 ### Removing an image from the index
 
@@ -214,6 +446,13 @@ Example using URL:
 ```bash
 curl -X POST -d '{"url":"http://example.com/query.jpg"}' http://localhost:4212/index/searcher
 ```
+
+Example using local file URL:
+```bash
+curl -X POST -d '{"url":"file:///path/to/local/query.jpg"}' http://localhost:4212/index/searcher
+```
+
+> **Note:** When using the `file://` URL scheme with Docker, ensure that the directory containing your images is mounted as a volume in the container.
 
 
 ### List all indexed image IDs

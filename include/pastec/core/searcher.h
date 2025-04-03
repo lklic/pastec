@@ -19,45 +19,38 @@
  * along with Pastec.  If not, see <http://www.gnu.org/licenses/>.
  *****************************************************************************/
 
-#ifndef PASTEC_ORBFEATUREEXTRACTOR_H
-#define PASTEC_ORBFEATUREEXTRACTOR_H
+#ifndef PASTEC_SEARCHER_H
+#define PASTEC_SEARCHER_H
 
-#include <iostream>
-#include <fstream>
-#include <list>
+#include <sys/types.h>
+#include <vector>
+#include <string>
 
 #include <opencv2/core/core.hpp>
-#include <opencv2/features2d/features2d.hpp>
 
-#include <orbindex.h>
-#include <orbwordindex.h>
-#include <featureextractor.h>
+namespace pastec {
 
 class ClientConnection;
 
-
-using namespace cv;
-using namespace std;
-
-
-class ORBFeatureExtractor : public FeatureExtractor
+struct SearchRequest
 {
-public:
-    ORBFeatureExtractor(ORBIndex *index, ORBWordIndex *wordIndex);
-    virtual ~ORBFeatureExtractor() {}
-
-    u_int32_t processNewImage(unsigned i_imageId, unsigned i_imgSize,
-                              char *p_imgData, unsigned &i_nbFeaturesExtracted);
-    
-    // Extract features without adding to index (for batch processing)
-    u_int32_t extractFeatures(unsigned i_imageId, unsigned i_imgSize,
-                             char *p_imgData, list<HitForward> &hits,
-                             unsigned &i_nbFeaturesExtracted);
-
-private:
-    ORBIndex *index;
-    ORBWordIndex *wordIndex;
-    Ptr<ORB> orb;
+    u_int32_t imageId;
+    std::vector<char> imageData;
+    ClientConnection *client;
+    std::vector<u_int32_t> results;
+    std::vector<cv::Rect> boundingRects;
+    std::vector<float> scores;
+    std::vector<std::string> tags;
 };
 
-#endif // PASTEC_ORBFEATUREEXTRACTOR_H
+class Searcher
+{
+public:
+    virtual ~Searcher() {}
+    virtual u_int32_t searchImage(SearchRequest &request) = 0;
+    virtual u_int32_t searchSimilar(SearchRequest &request) = 0;
+};
+
+} // namespace pastec
+
+#endif // PASTEC_SEARCHER_H

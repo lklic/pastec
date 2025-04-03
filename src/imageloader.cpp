@@ -36,7 +36,7 @@ u_int32_t ImageLoader::loadImage(unsigned i_imgSize, char *p_imgData, Mat &img)
 
     try
     {
-        img = imdecode(imgData, CV_LOAD_IMAGE_GRAYSCALE);
+        img = imdecode(imgData, cv::IMREAD_GRAYSCALE);
     }
     catch (cv::Exception& e) // The decoding of an image can raise an exception.
     {

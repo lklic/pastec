@@ -45,14 +45,16 @@ using namespace std;
 class ORBIndex : public Index
 {
 public:
-    ORBIndex(string indexPath, bool buildForwardIndex);
+    ORBIndex(string indexPath, string tagsPath, bool buildForwardIndex);
     virtual ~ORBIndex();
     void getImagesWithVisualWords(std::unordered_map<u_int32_t, list<Hit> > &imagesReqHits,
-                                  std::unordered_map<u_int32_t, vector<Hit> > &indexHitsForReq);
+                                  std::unordered_map<u_int32_t, const vector<Hit>* > &indexHitsForReq);
     unsigned getWordNbOccurences(unsigned i_wordId);
     unsigned countTotalNbWord(unsigned i_imageId);
     unsigned getTotalNbIndexedImages();
     u_int32_t addImage(unsigned i_imageId, list<HitForward> hitList);
+    u_int32_t addBatchImages(const unordered_map<u_int32_t, list<HitForward>>& batchHits);
+    u_int32_t addBatchTags(const unordered_map<u_int32_t, string>& batchTags);
     u_int32_t addTag(const unsigned i_imageId, const string tag);
     u_int32_t removeImage(const unsigned i_imageId);
     u_int32_t getImageWords(const unsigned i_imageId, unordered_map<u_int32_t, list<Hit> > &hitList);
@@ -68,15 +70,42 @@ public:
 
     void readLock();
     void unlock();
+    
+    // Get direct access to the word count vector
+    const vector<unsigned>& getWordCountVector() const;
+    
+    // Check if forward index is available
+    bool hasForwardIndex() const;
+    
+    // Get all words for an image from the forward index
+    const vector<unsigned>& getForwardIndexWords(u_int32_t i_imageId) const;
+    
+    // Get a hit for a specific word and image
+    const Hit* getHitForWordAndImage(u_int32_t i_wordId, u_int32_t i_imageId) const;
 
 private:
+    // Recalculate the total number of indexed images
+    void recalculateTotalIndexedImages();
+    
+    // Sort all word vectors by image ID to enable binary search in getHitForWordAndImage
+    // This improves lookup performance from O(n) to O(log n)
+    void sortAllWordVectors();
+    
+    // Update the index state by recalculating total indexed images and sorting word vectors
+    void updateIndexState();
+
     u_int64_t nbOccurences[NB_VISUAL_WORDS];
     u_int64_t totalNbRecords;
     bool buildForwardIndex;
+    unsigned m_totalIndexedImages; // Cached count of indexed images
 
-    unordered_map<u_int64_t, unsigned> nbWords;
-    unordered_map<u_int64_t, vector<unsigned> > forwardIndex;
-    unordered_map<u_int32_t, string> tags;
+    // Store the paths provided in the constructor
+    string storedIndexPath;
+    string storedTagsPath;
+
+    vector<unsigned> nbWords;
+    vector<vector<unsigned> > forwardIndex;
+    vector<string> tags;
     vector<Hit> indexHits[NB_VISUAL_WORDS];
 
     pthread_rwlock_t rwLock;

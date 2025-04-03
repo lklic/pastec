@@ -19,45 +19,45 @@
  * along with Pastec.  If not, see <http://www.gnu.org/licenses/>.
  *****************************************************************************/
 
-#ifndef PASTEC_ORBFEATUREEXTRACTOR_H
-#define PASTEC_ORBFEATUREEXTRACTOR_H
+#ifndef PASTEC_IMAGESEARCHER_H
+#define PASTEC_IMAGESEARCHER_H
 
-#include <iostream>
-#include <fstream>
-#include <list>
+#include <queue>
+#include <sys/time.h>
 
 #include <opencv2/core/core.hpp>
-#include <opencv2/features2d/features2d.hpp>
+#include <opencv2/flann/flann.hpp>
 
-#include <orbindex.h>
-#include <orbwordindex.h>
-#include <featureextractor.h>
+#include "pastec/core/searcher.h"
+#include "pastec/core/orb/orbindex.h"
+#include "pastec/core/orb/orbwordindex.h"
+#include "pastec/core/searchResult.h"
 
-class ClientConnection;
+namespace pastec {
 
+class ImageReranker;
 
-using namespace cv;
-using namespace std;
-
-
-class ORBFeatureExtractor : public FeatureExtractor
+class ORBSearcher : public Searcher
 {
 public:
-    ORBFeatureExtractor(ORBIndex *index, ORBWordIndex *wordIndex);
-    virtual ~ORBFeatureExtractor() {}
-
-    u_int32_t processNewImage(unsigned i_imageId, unsigned i_imgSize,
-                              char *p_imgData, unsigned &i_nbFeaturesExtracted);
-    
-    // Extract features without adding to index (for batch processing)
-    u_int32_t extractFeatures(unsigned i_imageId, unsigned i_imgSize,
-                             char *p_imgData, list<HitForward> &hits,
-                             unsigned &i_nbFeaturesExtracted);
+    ORBSearcher(ORBIndex *index, ORBWordIndex *wordIndex);
+    virtual ~ORBSearcher();
+    u_int32_t searchImage(SearchRequest &request);
+    u_int32_t searchSimilar(SearchRequest &request);
 
 private:
+    void returnResults(std::priority_queue<SearchResult> &rankedResults,
+                       SearchRequest &req, unsigned i_maxNbResults);
+    unsigned long getTimeDiff(const timeval t1, const timeval t2) const;
+    u_int32_t processSimilar(SearchRequest &request,
+                             std::unordered_map<u_int32_t, std::list<Hit> > imageReqHits);
+
     ORBIndex *index;
     ORBWordIndex *wordIndex;
-    Ptr<ORB> orb;
+    ImageReranker *reranker;
+    cv::Ptr<cv::ORB> orb;
 };
 
-#endif // PASTEC_ORBFEATUREEXTRACTOR_H
+} // namespace pastec
+
+#endif // PASTEC_IMAGESEARCHER_H
